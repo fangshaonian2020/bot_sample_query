@@ -1,9 +1,9 @@
 # main.py
 # 少数胜（A/B）回合制游戏插件
-# 版本 1.0.4：
-# - /announce_game 无参数，在当前群直接宣布活动
-# - 不调用 bot 低层接口，统一用 event.plain_result 在当前会话回复
-# - 玩家私聊用 /A /a /B /b 提交
+# 版本 1.0.5：
+# - 报名命令新增不冲突别名：/mg_register、/join、/报名、/参加
+# - 仍保留 /register（若被其他插件抢先处理，请使用 /mg_register 或 /join）
+# - 所有群内消息用 event.plain_result 回复；玩家提交在私聊中进行
 
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -41,7 +41,7 @@ class GameState:
     scores: Dict[int, int] = field(default_factory=dict)   # user_id -> score
     overtime: bool = False  # 是否处于延长赛模式
 
-@register("minor_game", "YourName", "少数胜 A/B 回合制游戏", "1.0.4")
+@register("minor_game", "YourName", "少数胜 A/B 回合制游戏", "1.0.5")
 class MinorGame(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -58,7 +58,7 @@ class MinorGame(Star):
     async def announce_game(self, event: AstrMessageEvent):
         """
         /announce_game
-        在“当前群”宣布活动、清空旧状态，等待玩家 /register
+        在“当前群”宣布活动、清空旧状态，等待玩家报名
         """
         if not is_group_event(event):
             yield event.plain_result("请在目标群内发送 /announce_game。")
@@ -67,36 +67,49 @@ class MinorGame(Star):
         gid = evt_group_id(event)
         title = "少数胜游戏"  # 如需自定义标题，可改这里或另加命令设置
 
-        # 重置状态并设置目标群
         self.state = GameState(group_id=gid, title=title)
-
-        # 在当前群回复公告
         yield event.plain_result(
-            f"【{title}】\n活动开始报名！请在本群发送 /register 报名参加。\n"
+            f"【{title}】\n活动开始报名！请在本群发送 /mg_register 或 /join（也可 /报名、/参加）报名参加。\n"
             f"管理员可用 /start_game 开始游戏（默认 5 轮，也可 /start_game 7 指定轮数）。\n"
             f"每轮请私聊我发送 /A 或 /B；少数方胜，平票则奇数轮 A 胜、偶数轮 B 胜。"
         )
 
-    # —— 2) 玩家报名（仅在目标群有效） ——
-    @filter.command("register")
-    async def register(self, event: AstrMessageEvent):
-        """
-        /register
-        仅在活动群中有效。报名成功后系统会维护你的分数。
-        """
+    # —— 2) 玩家报名（仅在目标群有效） —— 核心实现
+    async def _register_impl(self, event: AstrMessageEvent):
         s = self.state
         if not s.group_id:
             yield event.plain_result("当前没有正在报名的活动。请等待管理员 /announce_game。")
             return
-
         if not is_group_event(event) or evt_group_id(event) != s.group_id:
-            yield event.plain_result("请在活动群内发送 /register 报名。")
+            yield event.plain_result("请在活动群内报名。")
             return
 
         uid = event.get_sender_id()
         s.registered.add(uid)
         s.scores.setdefault(uid, 0)
         yield event.plain_result("报名成功！等待管理员 /start_game。")
+
+    # ——— 多个报名命令别名（避免 /register 冲突） ———
+    @filter.command("mg_register")
+    async def mg_register(self, event: AstrMessageEvent):
+        await self._register_impl(event)
+
+    @filter.command("join")
+    async def join(self, event: AstrMessageEvent):
+        await self._register_impl(event)
+
+    @filter.command("报名")
+    async def join_cn1(self, event: AstrMessageEvent):
+        await self._register_impl(event)
+
+    @filter.command("参加")
+    async def join_cn2(self, event: AstrMessageEvent):
+        await self._register_impl(event)
+
+    # 仍保留 /register（若被其他插件吞掉，请使用上面的别名）
+    @filter.command("register")
+    async def register(self, event: AstrMessageEvent):
+        await self._register_impl(event)
 
     # —— 2) 管理：开始游戏 ——
     @filter.command("start_game")
@@ -119,7 +132,6 @@ class MinorGame(Star):
             yield event.plain_result("还没有报名的玩家。")
             return
 
-        # 解析可选轮数参数
         parts = (event.message_str or "").strip().split()
         if len(parts) >= 1 and parts[0].isdigit():
             s.total_rounds = int(parts[0])
@@ -134,8 +146,8 @@ class MinorGame(Star):
             f"【{s.title}】开始！本局共 {s.total_rounds} 轮；报名人数：{len(s.registered)}。\n"
             f"现在开始第 1 轮：请所有玩家“私聊我”发送 /A 或 /B。"
         )
-        # 启动第一轮
-        await self._start_next_round(event)
+        async for res in self._start_next_round(event):
+            yield res
 
     # —— 3) 启动下一轮（在群内提示） ——
     async def _start_next_round(self, event: AstrMessageEvent):
@@ -151,7 +163,6 @@ class MinorGame(Star):
             "少数方胜；若 A/B 持平，则奇数轮 A 胜，偶数轮 B 胜。\n"
             "管理员可 /end_round 结算本轮。"
         )
-        # 在当前群（触发命令的群）回复
         yield event.plain_result(prompt)
 
     # —— 3) 玩家私聊提交 A/B（支持大小写） ——
@@ -174,8 +185,7 @@ class MinorGame(Star):
     async def _handle_choice(self, event: AstrMessageEvent, choice: str):
         s = self.state
         if not is_private_event(event):
-            # 只允许私聊提交
-            return
+            return  # 只允许私聊提交
 
         if not s.running or not s.in_round:
             yield event.plain_result("当前不在提交阶段。")
@@ -183,7 +193,7 @@ class MinorGame(Star):
 
         uid = event.get_sender_id()
         if uid not in s.registered:
-            yield event.plain_result("你尚未报名。请回到活动群内发送 /register 报名。")
+            yield event.plain_result("你尚未报名。请回到活动群内发送 /mg_register 或 /join。")
             return
 
         s.choices[uid] = choice
@@ -200,7 +210,6 @@ class MinorGame(Star):
             yield event.plain_result("请在活动群内使用 /end_round。")
             return
 
-        # 结算并在群内公布
         a, b, winner, reason = self._settle_round_logic()
         s.in_round = False
 
@@ -248,7 +257,6 @@ class MinorGame(Star):
             return
 
         if s.in_round:
-            # 先结算当前轮（不再进入下一轮）
             a, b, winner, reason = self._settle_round_logic()
             s.in_round = False
             lines = [
@@ -278,9 +286,9 @@ class MinorGame(Star):
             winner, reason = "B", "少数方胜"
 
         # 加分
-        winners: List[int] = [uid for uid, c in self.state.choices.items() if c == winner]
+        winners: List[int] = [uid for uid, c in s.choices.items() if c == winner]
         for uid in winners:
-            self.state.scores[uid] = self.state.scores.get(uid, 0) + 1
+            s.scores[uid] = s.scores.get(uid, 0) + 1
 
         return a, b, winner, reason
 
