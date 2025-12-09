@@ -1,14 +1,23 @@
 # main.py
-# 少数胜（A/B）回合制游戏插件（修复：不再使用 is_group/is_private，改为通过 get_group_id 判断）
+# 少数胜（A/B）回合制游戏插件
+# 流程：
+# 1) 管理：/announce_game <group_id> <title>  在指定群宣布活动
+# 2) 玩家：/register                         在该群报名
+# 3) 管理：/start_game [轮数=5]              开始，第1轮开始；玩家需私聊 /A 或 /B
+# 4) 管理：/end_round                        结束当前轮并结算（也可等全部玩家提交后再结算）
+# 5) 正常轮结束后若并列第一，则自动进入延长赛，一轮一轮直至打破平分
+# 6) /end_game                               随时强制终局并公布当前总分
 
 from __future__ import annotations
-from typing import Dict, Set, Optional, List, Tuple
 from dataclasses import dataclass, field
+from typing import Dict, Set, Optional, List, Tuple
+import re
+
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-# --------- 工具：根据事件判断群/私聊 ---------
+# ————— 工具：判断群/私聊 —————
 def evt_group_id(event: AstrMessageEvent) -> Optional[int]:
     try:
         gid = event.get_group_id()
@@ -23,7 +32,7 @@ def is_group_event(event: AstrMessageEvent) -> bool:
 def is_private_event(event: AstrMessageEvent) -> bool:
     return not is_group_event(event)
 
-# --------- 状态 ---------
+# ————— 状态模型 —————
 @dataclass
 class GameState:
     group_id: Optional[int] = None
@@ -37,7 +46,7 @@ class GameState:
     scores: Dict[int, int] = field(default_factory=dict)   # user_id -> score
     overtime: bool = False  # 是否处于延长赛模式
 
-@register("minor_game", "YourName", "少数胜 A/B 回合制游戏", "1.0.1")
+@register("minor_game", "YourName", "少数胜 A/B 回合制游戏", "1.0.2")
 class MinorGame(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -49,21 +58,18 @@ class MinorGame(Star):
     async def terminate(self):
         logger.info("[minor_game] 插件已卸载")
 
-    # 发送群文本（不同版本的 bot API 名称可能不同，这里做多重兼容）
+    # —— 发送群/私聊（兼容多种方法名） ——
     async def send_group(self, group_id: int, text: str):
         bot = getattr(self.context, "bot", None)
-        # 常见方法名：send_group_message / send_group_msg
         for name in ("send_group_message", "send_group_msg"):
             func = getattr(bot, name, None)
             if callable(func):
                 return await func(group_id, text)
-        # 兜底：call_api
         call_api = getattr(bot, "call_api", None)
         if callable(call_api):
             return await call_api("send_group_msg", group_id=group_id, message=text)
-        raise AttributeError("Bot 不支持发送群消息的已知方法，请告知我实际 API 名称。")
+        raise AttributeError("Bot 不支持发送群消息的方法，请告知实际 API 名称。")
 
-    # 发送私聊
     async def send_private(self, user_id: int, text: str):
         bot = getattr(self.context, "bot", None)
         for name in ("send_private_message", "send_private_msg"):
@@ -73,32 +79,43 @@ class MinorGame(Star):
         call_api = getattr(bot, "call_api", None)
         if callable(call_api):
             return await call_api("send_private_msg", user_id=user_id, message=text)
-        raise AttributeError("Bot 不支持发送私聊消息的已知方法，请告知我实际 API 名称。")
+        raise AttributeError("Bot 不支持发送私聊消息的方法，请告知实际 API 名称。")
 
-    # 1) 管理：宣布活动并指定群
+    # —— 1) 管理：宣布活动并指定群 ——
     @filter.command("announce_game")
     async def announce_game(self, event: AstrMessageEvent):
         """
         /announce_game <group_id> <title...>
         在指定群宣布活动、清空旧状态，等待玩家 /register
         """
-        args = (event.message_str or "").strip().split(maxsplit=1)
-        if len(args) < 1:
+        raw = (event.message_str or "")
+        # 拆分所有参数（去除多余空白）
+        parts = raw.strip().split()
+        if not parts:
             yield event.plain_result("用法：/announce_game <群号> <标题，可选>")
             return
 
-        try:
-            gid = int(args[0])
-        except Exception:
+        # 第一个参数过滤出数字
+        gid_text = re.sub(r"\D", "", parts[0])
+        if not gid_text:
             yield event.plain_result("群号必须是数字：/announce_game <群号> <标题>")
             return
+        gid = int(gid_text)
 
-        title = args[1] if len(args) > 1 else "少数胜游戏"
+        # 标题：从原始 raw 中剥离掉第一个参数后的剩余文本（保留空格）
+        title = ""
+        pos = raw.find(parts[0])
+        if pos != -1:
+            title = raw[pos + len(parts[0]):].strip()
+        if not title:
+            title = "少数胜游戏"
+
+        # 重置状态
         self.state = GameState(group_id=gid, title=title)
         await self.send_group(gid, f"【{title}】\n活动开始报名！请在本群发送 /register 报名参加。管理员可用 /start_game 开始游戏。")
-        yield event.plain_result("已发布活动并重置状态。")
+        yield event.plain_result(f"已发布活动：目标群 {gid}，标题：{title}")
 
-    # 2) 玩家报名（仅在目标群）
+    # —— 2) 玩家报名（仅目标群有效） ——
     @filter.command("register")
     async def register(self, event: AstrMessageEvent):
         """
@@ -119,7 +136,7 @@ class MinorGame(Star):
         s.scores.setdefault(uid, 0)
         yield event.plain_result("报名成功！等待管理员 /start_game。")
 
-    # 2) 管理：开始游戏
+    # —— 2) 管理：开始游戏 ——
     @filter.command("start_game")
     async def start_game(self, event: AstrMessageEvent):
         """
@@ -147,7 +164,7 @@ class MinorGame(Star):
         await self.send_group(s.group_id, f"【{s.title}】开始！本局共 {s.total_rounds} 轮。报名人数：{len(s.registered)}。")
         await self._start_next_round()
 
-    # 3) 启动下一轮
+    # —— 3) 启动下一轮 ——
     async def _start_next_round(self):
         s = self.state
         s.round_index += 1
@@ -163,14 +180,14 @@ class MinorGame(Star):
         )
         await self.send_group(s.group_id, prompt)
 
-        # 可选：私聊提醒
+        # 私聊提醒
         for uid in s.registered:
             try:
                 await self.send_private(uid, f"[{s.title}] {round_type} 已开始，请私聊发送 /A 或 /B。可重复修改，以最后一次为准。")
             except Exception as e:
                 logger.debug(f"私聊提醒失败 uid={uid}: {e}")
 
-    # 3) 玩家私聊提交 A/B（支持大小写）
+    # —— 3) 玩家私聊提交 A/B（支持大小写） ——
     @filter.command("A")
     async def choose_A(self, event: AstrMessageEvent):
         await self._handle_choice(event, "A")
@@ -205,7 +222,7 @@ class MinorGame(Star):
         s.choices[uid] = choice
         yield event.plain_result(f"已记录你的选择：{choice}（可重复修改，以最后一次为准）")
 
-    # 4) 管理：结束当前轮并结算
+    # —— 4) 管理：结束当前轮并结算 ——
     @filter.command("end_round")
     async def end_round(self, event: AstrMessageEvent):
         s = self.state
@@ -215,9 +232,9 @@ class MinorGame(Star):
 
         await self._settle_round()
 
-        # 5) 进入下一轮或结束
+        # —— 5) 进入下一轮或结束 ——
         if not s.overtime and s.round_index >= s.total_rounds:
-            # 正常轮打完，检查是否需要延长赛
+            # 正常轮已打完，检查是否需要延长赛
             leaders, top = self._leaders()
             if len(leaders) >= 2:
                 s.overtime = True
@@ -235,7 +252,7 @@ class MinorGame(Star):
         else:
             await self._start_next_round()
 
-    # 6) 管理：强制结束游戏
+    # —— 6) 管理：强制结束游戏 ——
     @filter.command("end_game")
     async def end_game(self, event: AstrMessageEvent):
         s = self.state
@@ -246,7 +263,7 @@ class MinorGame(Star):
             await self._settle_round()
         await self._finish_game()
 
-    # 结算当前轮
+    # —— 结算当前轮 —— 
     async def _settle_round(self):
         s = self.state
         s.in_round = False
@@ -278,13 +295,12 @@ class MinorGame(Star):
         ]
         await self.send_group(s.group_id, "\n".join(lines))
 
-    # 结束游戏，公布总分
+    # —— 结束游戏，公布总分 —— 
     async def _finish_game(self):
         s = self.state
         s.running = False
         s.in_round = False
 
-        # 排行
         ranking = sorted(s.scores.items(), key=lambda kv: (-kv[1], kv[0]))
         if not ranking:
             await self.send_group(s.group_id, "本次游戏无人得分。")
@@ -294,11 +310,11 @@ class MinorGame(Star):
                 lines.append(f"{i}. 玩家{uid}：{sc} 分")
             await self.send_group(s.group_id, "\n".join(lines))
 
-        # 清理本局状态但保留 group_id/title 以便复用
+        # 清理但保留群号与标题，便于复用
         gid, title = s.group_id, s.title
         self.state = GameState(group_id=gid, title=title)
 
-    # 计算领先者
+    # —— 计算领先者 —— 
     def _leaders(self) -> Tuple[List[int], int]:
         s = self.state
         if not s.scores:
